@@ -11,6 +11,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+import csv
+from datetime import datetime
+
 def set_seed(seed: int = 42):
     import random
     import numpy as np
@@ -31,6 +34,35 @@ def log(msg: str):
 
 def warn(msg: str):
     print(f"[WARNING] {msg}")
+
+# helper for plot
+def _now_tag() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+def _ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def make_run_dir(tag: str, plot_root: str = "./plot_data") -> str:
+    run_dir = os.path.join(plot_root, f"{tag}_{_now_tag()}")
+    _ensure_dir(run_dir)
+    return run_dir
+
+def csv_logger(run_dir: str):
+    """Create a CSV writer for epoch metrics."""
+    _ensure_dir(run_dir)
+    path = os.path.join(run_dir, "metrics.csv")
+    is_new = not os.path.exists(path)
+    f = open(path, "a", newline="", encoding="utf-8")
+    writer = csv.writer(f)
+    if is_new:
+        writer.writerow(["epoch","train_loss","train_acc","val_loss","val_acc","lr","secs"])
+    return f, writer, path
+
+def save_test_result(run_dir: str, loss: float, acc: float, meta: dict = None):
+    meta = {} if meta is None else dict(meta)
+    meta.update({"test_loss": float(loss), "test_acc": float(acc)})
+    with open(os.path.join(run_dir, "test.json"), "w", encoding="utf-8") as g:
+        json.dump(meta, g, ensure_ascii=False, indent=2)
 
 # Dataset
 class SkeletonNPZDataset(Dataset):
@@ -330,14 +362,14 @@ def evaluate(model, loader, device):
     return total_loss / max(1,total_n), total_acc / max(1,total_n)
 
 def train_torch(model, train_loader, val_loader, epochs=20, lr=1e-3, weight_decay=1e-2,
-                grad_clip=1.0, early_stop=5, use_amp=True, ckpt_dir="./ckpt"):
+                grad_clip=1.0, early_stop=5, use_amp=True, ckpt_dir="./ckpt", plot_run_dir: str = None):
     os.makedirs(ckpt_dir, exist_ok=True)
     device = device_auto()
     log(f"Device: {device}")
     model = model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type=="cuda"))
+    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
 
     steps_per_epoch = max(1, len(train_loader))
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -345,11 +377,17 @@ def train_torch(model, train_loader, val_loader, epochs=20, lr=1e-3, weight_deca
     )
     criterion = nn.CrossEntropyLoss()
 
+    # ---- CSV logger ----
+    csv_f, csv_w, csv_path = (None, None, None)
+    if plot_run_dir is not None:
+        csv_f, csv_w, csv_path = csv_logger(plot_run_dir)
+        log(f"[Plot] Logging metrics to: {csv_path}")
+
     best_val = float("inf")
     best_path = os.path.join(ckpt_dir, "best.pt")
     no_imp = 0
 
-    for ep in range(1, epochs+1):
+    for ep in range(1, epochs + 1):
         t0 = time.time()
         model.train()
         run_loss, run_correct, run_n = 0.0, 0, 0
@@ -358,7 +396,7 @@ def train_torch(model, train_loader, val_loader, epochs=20, lr=1e-3, weight_deca
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(use_amp and device.type=="cuda")):
+            with torch.cuda.amp.autocast(enabled=(use_amp and device.type == "cuda")):
                 logits = model(xb)
                 loss = criterion(logits, yb)
             scaler.scale(loss).backward()
@@ -368,17 +406,27 @@ def train_torch(model, train_loader, val_loader, epochs=20, lr=1e-3, weight_deca
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-            run_loss   += loss.item() * xb.size(0)
-            run_correct+= (logits.argmax(1) == yb).sum().item()
-            run_n      += xb.size(0)
+            run_loss += loss.item() * xb.size(0)
+            run_correct += (logits.argmax(1) == yb).sum().item()
+            run_n += xb.size(0)
 
-        train_loss = run_loss / max(1,run_n)
-        train_acc  = run_correct / max(1,run_n)
+        train_loss = run_loss / max(1, run_n)
+        train_acc = run_correct / max(1, run_n)
         val_loss, val_acc = evaluate(model, val_loader, device)
         dt = time.time() - t0
+        # 学习率（OneCycleLR 的当前 lr 在 param_groups[0]["lr"]）
+        cur_lr = optimizer.param_groups[0]["lr"]
+
         log(f"Epoch {ep:03d}/{epochs} | "
             f"train_loss={train_loss:.4f}, train_acc={train_acc:.4f} | "
             f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f} | {dt:.1f}s")
+
+        # ---- write a CSV row ----
+        if csv_w is not None:
+            csv_w.writerow([ep, f"{train_loss:.6f}", f"{train_acc:.6f}",
+                            f"{val_loss:.6f}", f"{val_acc:.6f}",
+                            f"{cur_lr:.8f}", f"{dt:.3f}"])
+            csv_f.flush()
 
         if val_loss < best_val - 1e-6:
             best_val = val_loss
@@ -395,9 +443,12 @@ def train_torch(model, train_loader, val_loader, epochs=20, lr=1e-3, weight_deca
         ckpt = torch.load(best_path, map_location=device)
         model.load_state_dict(ckpt["model"])
         log("Loaded best checkpoint.")
+
+    if csv_f is not None:
+        csv_f.close()
     return model
 
-# =============== MAIN ===============
+
 def main():
     set_seed(42)
     root = "./npz_fixed"
@@ -410,40 +461,43 @@ def main():
     idx_tr, idx_va, idx_te = split_7_2_1(files, label2id, seed=42)
     log(f"Split sizes -> train={len(idx_tr)}, val={len(idx_va)}, test={len(idx_te)}")
 
-    # --------- MLP ---------
-    # dl_tr, dl_va, dl_te = make_loaders(files, idx_tr, idx_va, idx_te, label2id,
-    #                                    mode="mlp", batch_size=512, num_workers=4)
-    # xb0, y0 = next(iter(dl_tr))
-    # D = xb0.shape[1]
-    # log(f"[MLP] Input dim D={D}")
-    # mlp = MLP(in_dim=D, n_classes=n_classes, hidden=512)
-    # mlp = train_torch(mlp, dl_tr, dl_va, epochs=20, lr=1e-3, ckpt_dir="./ckpt_mlp")
-    # te_loss, te_acc = evaluate(mlp, dl_te, device_auto())
-    # log(f"[MLP] Test loss={te_loss:.4f}, acc={te_acc:.4f}")
+    # MLP
+    dl_tr, dl_va, dl_te = make_loaders(files, idx_tr, idx_va, idx_te, label2id,
+                                       mode="mlp", batch_size=512, num_workers=4)
+    xb0, y0 = next(iter(dl_tr))
+    D = xb0.shape[1]
+    log(f"[MLP] Input dim D={D}")
+    run_dir_mlp = make_run_dir("MLP")
+    mlp = MLP(in_dim=D, n_classes=n_classes, hidden=512)
+    mlp = train_torch(mlp, dl_tr, dl_va, epochs=20, lr=1e-3, ckpt_dir="./ckpt_mlp", plot_run_dir=run_dir_mlp)
+    te_loss, te_acc = evaluate(mlp, dl_te, device_auto())
+    log(f"[MLP] Test loss={te_loss:.4f}, acc={te_acc:.4f}")
 
-    # --------- 1D-CNN ---------
+    # 1D-CNN
     # dl_tr_cnn, dl_va_cnn, dl_te_cnn = make_loaders(files, idx_tr, idx_va, idx_te, label2id,
     #                                                mode="cnn", batch_size=64, num_workers=4)
     # xb1, _ = next(iter(dl_tr_cnn))         # (B,C,T)
     # C, T = xb1.shape[1], xb1.shape[2]
     # log(f"[CNN1D] Channels={C}, T={T}")
+    # run_dir_cnn1 = make_run_dir("CNN")
     # cnn = CNN1D(in_channels=C, n_classes=n_classes, T=T)
-    # cnn = train_torch(cnn, dl_tr_cnn, dl_va_cnn, epochs=100, lr=8e-4, ckpt_dir="./ckpt_cnn")
+    # cnn = train_torch(cnn, dl_tr_cnn, dl_va_cnn, epochs=100, lr=8e-4, ckpt_dir="./ckpt_cnn", plot_run_dir=run_dir_cnn1)
     # te_loss, te_acc = evaluate(cnn, dl_te_cnn, device_auto())
     # log(f"[CNN1D] Test loss={te_loss:.4f}, acc={te_acc:.4f}")
 
-    # --------- RNN (GRU) ---------
+    # RNN (GRU)
     # dl_tr_rnn, dl_va_rnn, dl_te_rnn = make_loaders(files, idx_tr, idx_va, idx_te, label2id,
     #                                                mode="rnn", batch_size=128, num_workers=4)
     # xb2, _ = next(iter(dl_tr_rnn))         # (B,T,F)
     # F = xb2.shape[2]
     # log(f"[GRU] F={F}")
+    # run_dir_gru = make_run_dir("GRU")
     # rnn = GRUClassifier(input_size=F, n_classes=n_classes, hidden=256, layers=2, bidir=False)
-    # rnn = train_torch(rnn, dl_tr_rnn, dl_va_rnn, epochs=100, lr=1e-3, ckpt_dir="./ckpt_rnn")
+    # rnn = train_torch(rnn, dl_tr_rnn, dl_va_rnn, epochs=100, lr=1e-3, ckpt_dir="./ckpt_rnn", plot_run_dir=run_dir_gru)
     # te_loss, te_acc = evaluate(rnn, dl_te_rnn, device_auto())
     # log(f"[GRU] Test loss={te_loss:.4f}, acc={te_acc:.4f}")
 
-    # --------- 2D-CNN (treat each sample as a "T x F" image) ---------
+    # 2D-CNN
     # Reuse "rnn" mode loaders to get tensors shaped (B, T, F)
     # dl_tr_2d, dl_va_2d, dl_te_2d = make_loaders(
     #     files, idx_tr, idx_va, idx_te, label2id,
@@ -452,28 +506,29 @@ def main():
     # xb2d, _ = next(iter(dl_tr_2d))
     # T2D, F2D = xb2d.shape[1], xb2d.shape[2]
     # log(f"[CNN2D] Input as image: T={T2D}, F={F2D}")
+    # run_dir_cnn = make_run_dir("CNN2D")
     #
     # cnn2d = CNN2D(in_feat=F2D, n_classes=n_classes)
-    # cnn2d = train_torch(cnn2d, dl_tr_2d, dl_va_2d, epochs=100, lr=8e-4, ckpt_dir="./ckpt_cnn2d")
+    # cnn2d = train_torch(cnn2d, dl_tr_2d, dl_va_2d, epochs=100, lr=8e-4, ckpt_dir="./ckpt_cnn2d", plot_run_dir=run_dir_cnn)
     # te_loss, te_acc = evaluate(cnn2d, dl_te_2d, device_auto())
     # log(f"[CNN2D] Test loss={te_loss:.4f}, acc={te_acc:.4f}")
 
-    # ---------- Temporal Transformer ----------
+    # Transformer
     # Reuse "rnn" mode loaders to get (B,T,F) tensors
-    dl_tr_tx, dl_va_tx, dl_te_tx = make_loaders(
-        files, idx_tr, idx_va, idx_te, label2id,
-        mode="rnn", batch_size=64, num_workers=4
-    )
-    xb_tx, _ = next(iter(dl_tr_tx))
-    T_tx, F_tx = xb_tx.shape[1], xb_tx.shape[2]
-    log(f"[Transformer] Using (B,T,F) with T={T_tx}, F={F_tx}")
-
-    tx = TemporalTransformer(in_feat=F_tx, n_classes=n_classes,
-                             d_model=256, nhead=4, num_layers=2,
-                             dim_feedforward=512, dropout=0.1)
-    tx = train_torch(tx, dl_tr_tx, dl_va_tx, epochs=30, lr=1e-3, ckpt_dir="./ckpt_tx")
-    te_loss, te_acc = evaluate(tx, dl_te_tx, device_auto())
-    log(f"[Transformer] Test loss={te_loss:.4f}, acc={te_acc:.4f}")
+    # dl_tr_tx, dl_va_tx, dl_te_tx = make_loaders(
+    #     files, idx_tr, idx_va, idx_te, label2id,
+    #     mode="rnn", batch_size=64, num_workers=4
+    # )
+    # xb_tx, _ = next(iter(dl_tr_tx))
+    # T_tx, F_tx = xb_tx.shape[1], xb_tx.shape[2]
+    # log(f"[Transformer] Using (B,T,F) with T={T_tx}, F={F_tx}")
+    # run_dir_tx = make_run_dir("Transformer")
+    # tx = TemporalTransformer(in_feat=F_tx, n_classes=n_classes,
+    #                          d_model=256, nhead=4, num_layers=2,
+    #                          dim_feedforward=512, dropout=0.1)
+    # tx = train_torch(tx, dl_tr_tx, dl_va_tx, epochs=30, lr=1e-3, ckpt_dir="./ckpt_tx", plot_run_dir=run_dir_tx)
+    # te_loss, te_acc = evaluate(tx, dl_te_tx, device_auto())
+    # log(f"[Transformer] Test loss={te_loss:.4f}, acc={te_acc:.4f}")
 
 if __name__ == "__main__":
     main()
