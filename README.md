@@ -24,5 +24,6 @@ The process to run this project should be:
 4. training.py
 
 optional(after above):
+
 5. helper_data.py
 6. plot.py
