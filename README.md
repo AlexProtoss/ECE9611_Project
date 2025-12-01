@@ -18,11 +18,11 @@ plot.py takes "--run ./plot_data/xxx" as arguement to use data given after train
 
 The process to run this project should be:
 
-VideoCapture.py
-VideoProcess.py
-flush_skeleton_dataset.py
-training.py
+1. VideoCapture.py
+2. VideoProcess.py
+3. flush_skeleton_dataset.py
+4. training.py
 
 optional(after above):
-helper_data.py
-plot.py
+5. helper_data.py
+6. plot.py
