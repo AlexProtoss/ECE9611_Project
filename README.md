@@ -27,3 +27,8 @@ optional(after above):
 
 5. helper_data.py
 6. plot.py
+
+Requirements.txt
+
+1. Tensor version had a confilt with medipipe in numpy version in all version, for us just let one collect video then another one train
+2. yt-dpl seems required an external exe file and package
