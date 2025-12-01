@@ -1,0 +1,11 @@
+numpy==1.26.1
+torch==2.4.1
+torchvision==0.19.1
+scikit-learn==1.5.2
+tqdm==4.66.4
+matplotlib==3.8.4
+opencv-python==4.9.0.80
+moviepy==1.0.3
+pytube==15.0.0
+mediapipe==0.10.11
+protobuf>=3.20.3,<5.0.0
